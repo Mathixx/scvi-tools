@@ -306,6 +306,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
                 MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
                 MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
                 MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
+                MODULE_KEYS.BATCH_EMBEDDING_KEY: tensors.get(REGISTRY_KEYS.BATCH_EMBEDDING_KEY, None),
             }
         else:
             return {
@@ -328,6 +329,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
             MODULE_KEYS.Z_KEY: inference_outputs[MODULE_KEYS.Z_KEY],
             MODULE_KEYS.LIBRARY_KEY: inference_outputs[MODULE_KEYS.LIBRARY_KEY],
             MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
+            MODULE_KEYS.BATCH_EMBEDDING_KEY: tensors.get(REGISTRY_KEYS.BATCH_EMBEDDING_KEY, None),
             MODULE_KEYS.Y_KEY: tensors[REGISTRY_KEYS.LABELS_KEY],
             MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
             MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
@@ -365,6 +367,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
         n_samples: int = 1,
+        batch_embedding: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | Distribution | None]:
         """Run the regular inference process."""
         x_ = x
@@ -453,6 +456,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         size_factor: torch.Tensor | None = None,
         y: torch.Tensor | None = None,
         transform_batch: torch.Tensor | None = None,
+        batch_embedding: torch.Tensor | None = None,
     ) -> dict[str, Distribution | None]:
         """Run the generative process."""
         from torch.nn.functional import linear
@@ -885,3 +889,262 @@ class LDVAE(VAE):
             loadings = loadings[:, : -self.n_batch]
 
         return loadings
+
+class CustomBatchVAE(VAE):
+    """Variational auto-encoder with custom batch embeddings.
+    
+    This model extends the standard scVI VAE by replacing the default batch handling
+    with custom batch embeddings from adata.obsm.
+    
+    Parameters
+    ----------
+    n_input
+        Number of input genes
+    batch_embedding_dim
+        Dimensionality of the custom batch embeddings
+    n_hidden
+        Number of nodes per hidden layer
+    n_latent
+        Dimensionality of the latent space
+    n_layers
+        Number of hidden layers used for encoder and decoder NNs
+    dropout_rate
+        Dropout rate for neural networks
+    dispersion
+        One of the following
+        * ``'gene'`` - dispersion parameter of NB is constant per gene across cells
+        * ``'gene-batch'`` - dispersion can differ between different batches
+        * ``'gene-label'`` - dispersion can differ between different labels
+        * ``'gene-cell'`` - dispersion can differ for every gene in every cell
+    log_variational
+        Log(data+1) prior to encoding for numerical stability. Not normalization.
+    gene_likelihood
+        One of
+        * ``'nb'`` - Negative binomial distribution
+        * ``'zinb'`` - Zero-inflated negative binomial distribution
+        * ``'poisson'`` - Poisson distribution
+    latent_distribution
+        One of
+        * ``'normal'`` - Isotropic normal
+        * ``'ln'`` - Logistic normal with normal params N(0, 1)
+    use_observed_lib_size
+        Use observed library size for RNA as scaling factor in mean of conditional distribution
+    """
+    
+    def __init__(
+        self,
+        n_input: int,
+        batch_embedding_dim: int,
+        n_hidden: int = 128,
+        n_latent: int = 10,
+        n_layers: int = 1,
+        dropout_rate: float = 0.1,
+        dispersion: str = "gene",
+        log_variational: bool = True,
+        gene_likelihood: str = "zinb",
+        latent_distribution: str = "normal",
+        use_observed_lib_size: bool = True,
+        **kwargs,
+    ):
+        from scvi.nn import Encoder, DecoderSCVI
+        
+        # Disable default batch handling
+        kwargs["n_batch"] = 0
+        kwargs["encode_covariates"] = False
+        kwargs["n_continuous_cov"] = 0
+        kwargs["n_cats_per_cov"] = None
+        
+        # Store batch embedding dimension
+        self.batch_embedding_dim = batch_embedding_dim
+        
+        # Initialize parent class with modified parameters
+        super().__init__(
+            n_input=n_input,
+            n_hidden=n_hidden,
+            n_latent=n_latent,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            dispersion=dispersion,
+            log_variational=log_variational,
+            gene_likelihood=gene_likelihood,
+            latent_distribution=latent_distribution,
+            use_observed_lib_size=use_observed_lib_size,
+            **kwargs,
+        )
+        
+        # Recreate encoders with modified input dimensions to include batch embeddings
+        n_input_encoder = n_input + batch_embedding_dim
+        
+        # Recreate z encoder (latent representation encoder)
+        self.z_encoder = Encoder(
+            n_input_encoder,
+            n_latent,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            distribution=latent_distribution,
+            use_batch_norm=True,
+            use_layer_norm=False,
+            return_dist=True,
+        )
+        
+        # Recreate library size encoder
+        self.l_encoder = Encoder(
+            n_input_encoder,
+            1,
+            n_layers=1,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            use_batch_norm=True,
+            use_layer_norm=False,
+            return_dist=True,
+        )
+        
+        # Recreate decoder with modified input to include batch embeddings
+        n_input_decoder = n_latent + batch_embedding_dim
+        self.decoder = DecoderSCVI(
+            n_input_decoder,
+            n_input,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            use_batch_norm=True,
+            use_layer_norm=False,
+        )
+
+    @auto_move_data
+    def _regular_inference(
+        self,
+        x: torch.Tensor,
+        batch_index: torch.Tensor,
+        cont_covs: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,
+        batch_embedding: torch.Tensor | None = None,  # New parameter
+        n_samples: int = 1,
+    ) -> dict[str, torch.Tensor | Distribution | None]:
+        """Run inference with custom batch embeddings."""
+        x_ = x
+        if self.use_observed_lib_size:
+            library = torch.log(x.sum(1)).unsqueeze(1)
+        if self.log_variational:
+            x_ = torch.log1p(x_)
+    
+        # Use batch_embedding directly
+        if batch_embedding is None:
+            raise ValueError("Batch embeddings are required but were not provided")
+        
+        # Combine gene expression with batch embeddings
+        encoder_input = torch.cat([x_, batch_embedding], dim=-1)
+    
+        # Run encoders with combined input
+        qz, z = self.z_encoder(encoder_input)
+    
+        ql = None
+        if not self.use_observed_lib_size:
+            ql, library_encoded = self.l_encoder(encoder_input)
+            library = library_encoded
+        
+        if n_samples > 1:
+            untran_z = qz.sample((n_samples,))
+            z = self.z_encoder.z_transformation(untran_z)
+            if self.use_observed_lib_size:
+                library = library.unsqueeze(0).expand(
+                    (n_samples, library.size(0), library.size(1))
+                )
+            else:
+                library = ql.sample((n_samples,))
+            
+        return {
+            MODULE_KEYS.Z_KEY: z,
+            MODULE_KEYS.QZ_KEY: qz,
+            MODULE_KEYS.QL_KEY: ql,
+            MODULE_KEYS.LIBRARY_KEY: library,
+        }
+        
+    @auto_move_data
+    def generative(
+        self,
+        z: torch.Tensor,
+        library: torch.Tensor,
+        batch_index: torch.Tensor,
+        batch_embedding: torch.Tensor | None = None,  # New parameter
+        cont_covs: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,
+        size_factor: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
+        transform_batch: torch.Tensor | None = None,
+    ) -> dict[str, Distribution | None]:
+        """Run the generative process."""
+        from torch.nn.functional import linear
+
+        from scvi.distributions import (
+            NegativeBinomial,
+            Normal,
+            Poisson,
+            ZeroInflatedNegativeBinomial,
+        )
+
+        # Prepare decoder input
+        decoder_input = z
+    
+        # Use batch_embedding directly
+        if batch_embedding is None:
+            raise ValueError("Batch embeddings are required but were not provided")
+        
+        # Add batch embeddings to decoder input
+        decoder_input = torch.cat([decoder_input, batch_embedding], dim=-1)
+    
+        if not self.use_size_factor_key:
+            size_factor = library
+        
+        # Run decoder with combined input
+        px_scale, px_r, px_rate, px_dropout = self.decoder(
+            self.dispersion,
+            decoder_input,
+            size_factor,
+            None,  # No batch index needed
+            *(() if cat_covs is None else torch.split(cat_covs, 1, dim=1)),
+            y,
+        )
+
+        if self.dispersion == "gene-label":
+            px_r = linear(
+                one_hot(y.squeeze(-1), self.n_labels).float(), self.px_r
+            )  # px_r gets transposed - last dimension is nb genes
+        elif self.dispersion == "gene-batch":
+            px_r = linear(one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
+        elif self.dispersion == "gene":
+            px_r = self.px_r
+
+        px_r = torch.exp(px_r)
+
+        if self.gene_likelihood == "zinb":
+            px = ZeroInflatedNegativeBinomial(
+                mu=px_rate,
+                theta=px_r,
+                zi_logits=px_dropout,
+                scale=px_scale,
+            )
+        elif self.gene_likelihood == "nb":
+            px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
+        elif self.gene_likelihood == "poisson":
+            px = Poisson(rate=px_rate, scale=px_scale)
+        elif self.gene_likelihood == "normal":
+            px = Normal(px_rate, px_r, normal_mu=px_scale)
+
+        # Priors
+        if self.use_observed_lib_size:
+            pl = None
+        else:
+            (
+                local_library_log_means,
+                local_library_log_vars,
+            ) = self._compute_local_library_params(batch_index)
+            pl = Normal(local_library_log_means, local_library_log_vars.sqrt())
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+
+        return {
+            MODULE_KEYS.PX_KEY: px,
+            MODULE_KEYS.PL_KEY: pl,
+            MODULE_KEYS.PZ_KEY: pz,
+        }
+

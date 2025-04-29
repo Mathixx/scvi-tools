@@ -14,10 +14,11 @@ from scvi.data.fields import (
     LayerField,
     NumericalJointObsField,
     NumericalObsField,
+    ObsmField,
 )
 from scvi.model._utils import _init_library_size
 from scvi.model.base import EmbeddingMixin, UnsupervisedTrainingMixin
-from scvi.module import VAE
+from scvi.module import VAE, CustomBatchVAE
 from scvi.utils import setup_anndata_dsp
 
 from .base import ArchesMixin, BaseMinifiedModeModelClass, RNASeqMixin, VAEMixin
@@ -25,7 +26,7 @@ from .base import ArchesMixin, BaseMinifiedModeModelClass, RNASeqMixin, VAEMixin
 if TYPE_CHECKING:
     from typing import Literal
 
-    from anndata import AnnData
+    from anndata import AnnData, AnnDataField
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,99 @@ class SCVI(
         adata_minify_type = _get_adata_minify_type(adata)
         if adata_minify_type is not None:
             anndata_fields += cls._get_fields_for_adata_minification(adata_minify_type)
+        adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
+        adata_manager.register_fields(adata, **kwargs)
+        cls.register_manager(adata_manager)
+
+
+
+class CustomBatchSCVI(SCVI):
+    """SCVI model with custom batch embeddings.
+    
+    This model extends the standard SCVI model by using custom batch embeddings
+    from adata.obsm instead of one-hot encodings or learned embeddings.
+    
+    Parameters
+    ----------
+    adata
+        AnnData object containing gene expression and batch embeddings
+    batch_embedding_key
+        Key in adata.obsm where batch embeddings are stored
+    n_latent
+        Dimensionality of the latent space
+    **model_kwargs
+        Additional keyword arguments for the VAE
+    """
+    
+    _module_cls = CustomBatchVAE
+    
+    def __init__(
+        self,
+        adata: AnnData,
+        batch_embedding_key: str,
+        n_latent: int = 10,
+        **model_kwargs
+    ):
+        # Get embedding dimension from data
+        if batch_embedding_key not in adata.obsm:
+            raise ValueError(f"Batch embedding key '{batch_embedding_key}' not found in adata.obsm")
+        
+        batch_embedding_dim = adata.obsm[batch_embedding_key].shape[1]
+        
+        # Initialize with custom batch embedding dimension
+        super().__init__(
+            adata,
+            n_latent=n_latent,
+            batch_embedding_dim=batch_embedding_dim,
+            **model_kwargs
+        )
+        self._model_summary_string = (
+            f"CustomBatchSCVI Model with the following params: \n"
+            f"n_latent: {n_latent}, batch_embedding_dim: {batch_embedding_dim}"
+        )
+        
+        self.batch_embedding_key = batch_embedding_key
+        
+        self.init_params_ = self._get_init_params(locals())
+        
+    @classmethod
+    def setup_anndata(
+        cls,
+        adata: AnnData,
+        layer: str | None = None,
+        batch_key: str | None = None,
+        labels_key: str | None = None,
+        size_factor_key: str | None = None,
+        categorical_covariate_keys: list[str] | None = None,
+        continuous_covariate_keys: list[str] | None = None,
+        batch_embedding_key: str | None = None,
+        **kwargs,
+    ) -> None:
+        """
+        Exactly mirrors SCVI.setup_anndata, but **also** adds an ObsmField
+        for `batch_embedding_key` at the end.
+        """
+        setup_method_args = cls._get_setup_method_args(**locals())
+
+        anndata_fields = [
+            LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
+            CategoricalObsField(REGISTRY_KEYS.LABELS_KEY, labels_key),
+            NumericalObsField(REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, required=False),
+            CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
+            NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
+        ]
+
+        adata_minify_type = _get_adata_minify_type(adata)
+        if adata_minify_type is not None:
+            anndata_fields += cls._get_fields_for_adata_minification(adata_minify_type)
+
+        if batch_embedding_key is None:
+            raise ValueError("You must provide batch_embedding_key to setup_anndata")
+        anndata_fields.append(
+            ObsmField(REGISTRY_KEYS.BATCH_EMBEDDING_KEY, batch_embedding_key)
+        )
+
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)

@@ -472,7 +472,7 @@ class BaseModelClass(metaclass=BaseModelMetaClass):
                 "Input AnnData not setup with scvi-tools. "
                 + "attempting to transfer AnnData setup"
             )
-            self._register_manager_for_instance(self.adata_manager.transfer_fields(adata))
+            self._register_manager_for_instance(self.adata_manager.transfer_fields(adata, extend_categories=True))
         else:
             # Case where correct AnnDataManager is found, replay registration as necessary.
             adata_manager.validate()

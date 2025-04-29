@@ -11,6 +11,7 @@ class _MODULE_KEYS(NamedTuple):
     LIBRARY_KEY: str = "library"
     QL_KEY: str = "ql"
     BATCH_INDEX_KEY: str = "batch_index"
+    BATCH_EMBEDDING_KEY: str = "batch_embedding"
     Y_KEY: str = "y"
     CONT_COVS_KEY: str = "cont_covs"
     CAT_COVS_KEY: str = "cat_covs"
